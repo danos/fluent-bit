@@ -1,0 +1,163 @@
+Add "raw" format option for Kafka, which allows a single named field
+to be sent as the kafka payload, rather than a msgpack or json formatted
+structure. This will by default be extracted from the field named
+"payload", but the name of the field can be overwridden using the
+"Raw_Key" configuration variable.
+---
+ plugins/out_kafka/kafka.c        |   42 +++++++++++++++++++++++++++++----------
+ plugins/out_kafka/kafka_config.c |   14 +++++++++++++
+ plugins/out_kafka/kafka_config.h |    5 ++++
+ 3 files changed, 51 insertions(+), 10 deletions(-)
+
+--- a/plugins/out_kafka/kafka.c
++++ b/plugins/out_kafka/kafka.c
+@@ -73,7 +73,7 @@ int produce_message(struct flb_time *tm,
+     int ret;
+     int size;
+     int queue_full_retries = 0;
+-    char *out_buf;
++    char *out_buf = NULL;
+     size_t out_size;
+     struct flb_kafka_topic *topic = NULL;
+     msgpack_sbuffer mp_sbuf;
+@@ -82,9 +82,11 @@ int produce_message(struct flb_time *tm,
+     msgpack_object val;
+     flb_sds_t s;
+ 
+-    /* Init temporal buffers */
+-    msgpack_sbuffer_init(&mp_sbuf);
+-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
++    if (ctx->format != FLB_KAFKA_FMT_RAW) {
++        /* Init temporal buffers */
++        msgpack_sbuffer_init(&mp_sbuf);
++        msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
++    }
+ 
+     if (ctx->format == FLB_KAFKA_FMT_JSON || ctx->format == FLB_KAFKA_FMT_MSGP) {
+         /* Make room for the timestamp */
+@@ -121,7 +123,7 @@ int produce_message(struct flb_time *tm,
+                 break;
+         }
+     }
+-    else {
++    else if (ctx->format != FLB_KAFKA_FMT_RAW) {
+         size = map->via.map.size;
+         msgpack_pack_map(&mp_pck, size);
+     }
+@@ -130,8 +132,17 @@ int produce_message(struct flb_time *tm,
+         key = map->via.map.ptr[i].key;
+         val = map->via.map.ptr[i].val;
+ 
+-        msgpack_pack_object(&mp_pck, key);
+-        msgpack_pack_object(&mp_pck, val);
++        if (ctx->format == FLB_KAFKA_FMT_RAW) {
++            /* check if name of the raw key */
++            if (key.via.str.size == ctx->raw_key_len &&
++                strncmp(key.via.str.ptr, ctx->raw_key, ctx->raw_key_len) == 0) {
++                    out_buf = (char *)val.via.str.ptr;
++                    out_size = val.via.str.size;
++            }
++        } else {
++            msgpack_pack_object(&mp_pck, key);
++            msgpack_pack_object(&mp_pck, val);
++        }
+ 
+         /* Lookup key/topic */
+         if (ctx->topic_key && !topic && val.type == MSGPACK_OBJECT_STR) {
+@@ -170,15 +181,24 @@ int produce_message(struct flb_time *tm,
+         out_size = flb_sds_len(s);
+     }
+ 
++    if (out_buf == NULL) {
++        flb_warn("[out_kafka] no message to send");
++        if (ctx->format != FLB_KAFKA_FMT_RAW)
++            msgpack_sbuffer_destroy(&mp_sbuf);
++        return FLB_ERROR;
++    }
++
+     if (!topic) {
+         topic = flb_kafka_topic_default(ctx);
+     }
+     if (!topic) {
+         flb_error("[out_kafka] no default topic found");
+-        msgpack_sbuffer_destroy(&mp_sbuf);
++        if (ctx->format != FLB_KAFKA_FMT_RAW)
++            msgpack_sbuffer_destroy(&mp_sbuf);
+         return FLB_ERROR;
+     }
+ 
++
+  retry:
+     if (queue_full_retries >= 10) {
+         if (ctx->format == FLB_KAFKA_FMT_JSON) {
+@@ -187,7 +207,8 @@ int produce_message(struct flb_time *tm,
+         if (ctx->format == FLB_KAFKA_FMT_GELF) {
+             flb_sds_destroy(s);
+         }
+-        msgpack_sbuffer_destroy(&mp_sbuf);
++        if (ctx->format != FLB_KAFKA_FMT_RAW)
++            msgpack_sbuffer_destroy(&mp_sbuf);
+         return FLB_RETRY;
+     }
+ 
+@@ -249,7 +270,8 @@ int produce_message(struct flb_time *tm,
+         flb_sds_destroy(s);
+     }
+ 
+-    msgpack_sbuffer_destroy(&mp_sbuf);
++    if (ctx->format != FLB_KAFKA_FMT_RAW)
++        msgpack_sbuffer_destroy(&mp_sbuf);
+     return FLB_OK;
+ }
+ 
+--- a/plugins/out_kafka/kafka_config.c
++++ b/plugins/out_kafka/kafka_config.c
+@@ -126,6 +126,9 @@ struct flb_kafka *flb_kafka_conf_create(
+         else if (strcasecmp(tmp, "gelf") == 0) {
+             ctx->format = FLB_KAFKA_FMT_GELF;
+         }
++	else if (strcasecmp(tmp, "raw") == 0) {
++            ctx->format = FLB_KAFKA_FMT_RAW;
++        }
+     }
+     else {
+         ctx->format = FLB_KAFKA_FMT_JSON;
+@@ -142,6 +145,17 @@ struct flb_kafka *flb_kafka_conf_create(
+         ctx->message_key_len = 0;
+     }
+ 
++    /* Config: Raw_Key */
++    tmp = flb_output_get_property("raw_key", ins);
++    if (tmp) {
++        ctx->raw_key = flb_strdup(tmp);
++        ctx->raw_key_len = strlen(tmp);
++    }
++    else {
++        ctx->raw_key = flb_strdup("payload");
++        ctx->raw_key_len = strlen("payload");
++    }
++
+     /* Config: Timestamp_Key */
+     tmp = flb_output_get_property("timestamp_key", ins);
+     if (tmp) {
+--- a/plugins/out_kafka/kafka_config.h
++++ b/plugins/out_kafka/kafka_config.h
+@@ -30,6 +30,7 @@
+ #define FLB_KAFKA_FMT_JSON  0
+ #define FLB_KAFKA_FMT_MSGP  1
+ #define FLB_KAFKA_FMT_GELF  2
++#define FLB_KAFKA_FMT_RAW   3
+ #define FLB_KAFKA_BROKERS   "127.0.0.1"
+ #define FLB_KAFKA_TOPIC     "fluent-bit"
+ #define FLB_KAFKA_TS_KEY    "@timestamp"
+@@ -61,6 +62,10 @@ struct flb_kafka {
+     int message_key_len;
+     char *message_key;
+ 
++    /* Name of field containing the payload when using raw format */
++    int raw_key_len;
++    char *raw_key;
++
+     /* Gelf Keys */
+     struct flb_gelf_fields gelf_fields;
+ 

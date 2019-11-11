@@ -1,0 +1,92 @@
+Update to add config "Message_Key_Is_Name" to make the "Message_Key"
+variable the name of a field to add as the kafka key, rather than using
+the value of "Message_Key" directly.
+
+This patch is needed until this upstream PR is merged:
+https://github.com/fluent/fluent-bit/pull/1176
+---
+ plugins/out_kafka/kafka.c        |   19 ++++++++++++++++++-
+ plugins/out_kafka/kafka_config.c |    7 +++++++
+ plugins/out_kafka/kafka_config.h |    9 +++++++++
+ 3 files changed, 34 insertions(+), 1 deletion(-)
+
+--- a/plugins/out_kafka/kafka.c
++++ b/plugins/out_kafka/kafka.c
+@@ -81,6 +81,8 @@ int produce_message(struct flb_time *tm,
+     msgpack_object key;
+     msgpack_object val;
+     flb_sds_t s;
++    void *kafka_key = NULL;
++    size_t kafka_key_len = 0;
+ 
+     if (ctx->format != FLB_KAFKA_FMT_RAW) {
+         /* Init temporal buffers */
+@@ -153,6 +155,16 @@ int produce_message(struct flb_time *tm,
+                                                ctx);
+             }
+         }
++
++        if (ctx->message_key_is_name && ctx->message_key &&
++            val.type == MSGPACK_OBJECT_STR) {
++            if (key.via.str.size == ctx->message_key_len &&
++                strncmp(key.via.str.ptr, ctx->message_key,
++                ctx->message_key_len) == 0) {
++                    kafka_key = val.via.str.ptr;
++                    kafka_key_len = val.via.str.size;
++            }
++        }
+     }
+ 
+     if (ctx->format == FLB_KAFKA_FMT_JSON) {
+@@ -212,11 +224,16 @@ int produce_message(struct flb_time *tm,
+         return FLB_RETRY;
+     }
+ 
++    if (!ctx->message_key_is_name) {
++        kafka_key = ctx->message_key;
++        kafka_key_len = ctx->message_key_len;
++    }
++
+     ret = rd_kafka_produce(topic->tp,
+                            RD_KAFKA_PARTITION_UA,
+                            RD_KAFKA_MSG_F_COPY,
+                            out_buf, out_size,
+-                           ctx->message_key, ctx->message_key_len,
++                           kafka_key, kafka_key_len,
+                            NULL);
+     if (ret == -1) {
+         fprintf(stderr,
+--- a/plugins/out_kafka/kafka_config.c
++++ b/plugins/out_kafka/kafka_config.c
+@@ -145,6 +145,13 @@ struct flb_kafka *flb_kafka_conf_create(
+         ctx->message_key_len = 0;
+     }
+ 
++    /* Config: Message_Key_Is_Name */
++    tmp = flb_output_get_property("message_key_is_name", ins);
++    if (tmp && ((strcasecmp(tmp, "true") == 0 || strcasecmp(tmp, "on") == 0)))
++            ctx->message_key_is_name = FLB_TRUE;
++    else
++            ctx->message_key_is_name = FLB_FALSE;
++
+     /* Config: Raw_Key */
+     tmp = flb_output_get_property("raw_key", ins);
+     if (tmp) {
+--- a/plugins/out_kafka/kafka_config.h
++++ b/plugins/out_kafka/kafka_config.h
+@@ -62,6 +62,15 @@ struct flb_kafka {
+     int message_key_len;
+     char *message_key;
+ 
++    /*
++     * message_key is put directly in the message as the kafka key, rather
++     * than being the name of the field to extract as the kafka key.
++     * That may be an error in implementation, so add configuration
++     * "message_key_is_name" to toggle the behaviour so it is backwards
++     * compatible.
++     */
++    uint8_t message_key_is_name;
++
+     /* Name of field containing the payload when using raw format */
+     int raw_key_len;
+     char *raw_key;

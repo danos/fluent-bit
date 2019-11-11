@@ -1,0 +1,1382 @@
+Updated zmq handling so that the topic and key are not sent on the
+ZMQ channel, instead they are created in the zmq plugin based on
+the protobuf message and configuration of the plugin instance.
+--- a/plugins/in_zmq/CMakeLists.txt
++++ b/plugins/in_zmq/CMakeLists.txt
+@@ -1,4 +1,24 @@
++# Protobuf names and paths for ZMQ protobuf file
++set(FLB_PROTOBUF_DIR /usr/share/vyatta-dataplane/protobuf)
++set(FLB_PROTOBUF CgnatLogging.proto)
++set(FLB_PROTOBUF_H CgnatLogging.pb-c.h)
++set(FLB_PROTOBUF_C CgnatLogging.pb-c.c)
++
++include_directories(
++  ${FLB_PROTOBUF_DIR}
++  ${CMAKE_CURRENT_BINARY_DIR}
++)
++
++ADD_CUSTOM_COMMAND(
++  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${FLB_PROTOBUF_H} ${CMAKE_CURRENT_BINARY_DIR}/${FLB_PROTOBUF_C}
++  COMMAND protoc-c -I ${FLB_PROTOBUF_DIR} --c_out=${CMAKE_CURRENT_BINARY_DIR} ${FLB_PROTOBUF_DIR}/${FLB_PROTOBUF}
++  DEPENDS ${FLB_PROTOBUF_DIR}/${FLB_PROTOBUF}
++)
++
+ set(src
+-  in_zmq.c)
++  in_zmq.c
++  in_zmq_config.c
++  in_zmq_astr.c
++  ${CMAKE_CURRENT_BINARY_DIR}/${FLB_PROTOBUF_C})
+ 
+-FLB_PLUGIN(in_zmq "${src}" "czmq")
++FLB_PLUGIN(in_zmq "${src}" "protobuf-c -lczmq")
+--- a/plugins/in_zmq/in_zmq.c
++++ b/plugins/in_zmq/in_zmq.c
+@@ -32,8 +32,12 @@
+ #include <errno.h>
+ #include <inttypes.h>
+ #include <czmq.h>
++#include <sys/utsname.h>
++#include <linux/if.h>
+ 
++#include "CgnatLogging.pb-c.h"
+ #include "in_zmq.h"
++#include "in_zmq_astr.h"
+ 
+ #ifdef __GNUC__
+ #define likely(x)       __builtin_expect(!!(x), 1)
+@@ -43,10 +47,491 @@
+ #define unlikely(x)     (x)
+ #endif
+ 
++/*
++ * These gives the maximum number of characters that may be used
++ * (not including a terminator) when printing a number to a string
++ */
++#define MAX_STRLEN_DECIMAL_UINT8        3       /* e.g. 255 */
++#define MAX_STRLEN_DECIMAL_UINT16       5       /* e.g. 65535 */
++#define MAX_STRLEN_DECIMAL_UINT32       10      /* e.g. 4294967295 */
++
++static struct utsname utsname;
++
++static char *cgn_instance = "vyatta";
++static size_t cgn_instance_strlen = strlen("vyatta");
++
++static int set_cgn_instance(void)
++{
++    int ret = uname(&utsname);
++
++    if (ret < 0)
++        return -errno;
++
++    cgn_instance = utsname.nodename;
++    cgn_instance_strlen = strlen(cgn_instance);
++
++    return 0;
++}
++
++static int calculate_alloc_key_size(struct flb_in_zmq_ctx *ctx)
++{
++    int ksize = 0;
++    int num_fields = 0;
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_CGN_INSTANCE)) {
++        ksize += cgn_instance_strlen;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_SESSION_ID)) {
++        ksize += MAX_STRLEN_DECIMAL_UINT32;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_SUB_SESSION_ID)) {
++        ksize += MAX_STRLEN_DECIMAL_UINT32;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_IP_PROTOCOL)) {
++        ksize += MAX_STRLEN_DECIMAL_UINT8;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS)) {
++        ksize += INET_ADDRSTRLEN - 1; /* do not include '\0' */
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_SUBSCRIBER_PORT)) {
++        ksize += MAX_STRLEN_DECIMAL_UINT16;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_PUBLIC_IP_ADDRESS)) {
++        ksize += INET_ADDRSTRLEN - 1;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_PUBLIC_PORT)) {
++        ksize += MAX_STRLEN_DECIMAL_UINT16;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_DEST_IP_ADDRESS)) {
++        ksize += INET_ADDRSTRLEN - 1;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_DEST_PORT)) {
++        ksize += MAX_STRLEN_DECIMAL_UINT16;
++        num_fields++;
++    }
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_INTERFACE)) {
++        ksize += IFNAMSIZ;
++        num_fields++;
++    }
++
++    /* allow for delimiter characters */
++    if (num_fields > 0)
++        ksize += ctx->delimiter_strlen * (num_fields - 1);
++
++    return ksize;
++}
++
++static inline int add_delim(bool *add_delimiter, struct app_str *ks,
++                            const char *delimiter, size_t delimiter_strlen)
++{
++    if (*add_delimiter)
++        return app_str_raw(ks, delimiter, delimiter_strlen);
++
++    *add_delimiter = true;
++    return 0;
++}
++
++static inline int add_ip_addr(struct app_str *ks, uint32_t addr)
++{
++    char ip_str[INET_ADDRSTRLEN];
++    struct in_addr ipa;
++
++    ipa.s_addr = htonl(addr);
++    inet_ntop(AF_INET, &ipa, ip_str, INET_ADDRSTRLEN);
++    return app_str_raw(ks, ip_str, strlen(ip_str));
++}
++
++static int build_subscriber_key(struct flb_in_zmq_ctx *ctx,
++                                struct app_str *ks, SubscriberLog *msg)
++{
++    int ret;
++    const char *delimiter = ctx->delimiter;
++    size_t delimiter_strlen = ctx->delimiter_strlen;
++    bool add_delimiter = false;
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_CGN_INSTANCE)) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_raw(ks, cgn_instance, cgn_instance_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS)) &&
++        msg->has_subscriberaddress) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = add_ip_addr(ks, msg->subscriberaddress);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    return 0;
++
++fail:
++    flb_debug("[in_zmq] %s: failed creating key (%s)\n",
++             __func__, strerror(-ret));
++    return ret;
++}
++
++static int build_session_key(struct flb_in_zmq_ctx *ctx,
++                             struct app_str *ks, SessionLog *msg)
++{
++    int ret;
++    const char *delimiter = ctx->delimiter;
++    size_t delimiter_strlen = ctx->delimiter_strlen;
++    bool add_delimiter = false;
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_CGN_INSTANCE)) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_raw(ks, cgn_instance, cgn_instance_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_SESSION_ID)) &&
++        msg->has_sessionid) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_printf(ks, "%lu", msg->sessionid);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_SUB_SESSION_ID)) &&
++        msg->has_subsessionid) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_printf(ks, "%u", msg->subsessionid);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_IP_PROTOCOL)) &&
++        msg->has_protocol) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_printf(ks, "%u", msg->protocol);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS)) &&
++        msg->has_subscriberaddress) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = add_ip_addr(ks, msg->subscriberaddress);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_SUBSCRIBER_PORT)) &&
++        msg->has_subscriberport) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_printf(ks, "%u", msg->subscriberport);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_PUBLIC_IP_ADDRESS)) &&
++        msg->has_natallocatedaddress) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = add_ip_addr(ks, msg->natallocatedaddress);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_PUBLIC_PORT)) &&
++        msg->has_natallocatedport) {
++        ret = add_delim(&add_delimiter, ks, delimiter,
++                                   delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_printf(ks, "%u", msg->natallocatedport);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_DEST_IP_ADDRESS)) &&
++        msg->has_destinationaddress) {
++        ret = add_delim(&add_delimiter, ks, delimiter,
++                                   delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = add_ip_addr(ks, msg->destinationaddress);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_DEST_PORT)) &&
++        msg->has_destinationport) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_printf(ks, "%u", msg->destinationport);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_INTERFACE)) &&
++        msg->ifname != NULL) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_raw(ks, msg->ifname, strlen(msg->ifname));
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    return 0;
++
++fail:
++    flb_debug("[in_zmq] %s: failed creating key (%s)\n",
++             __func__, strerror(-ret));
++    return ret;
++}
++
++static int build_port_block_alloc_key(struct flb_in_zmq_ctx *ctx,
++                                      struct app_str *ks,
++                                      PortAllocationLog *msg)
++{
++    int ret;
++    const char *delimiter = ctx->delimiter;
++    size_t delimiter_strlen = ctx->delimiter_strlen;
++    bool add_delimiter = false;
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_CGN_INSTANCE)) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = app_str_raw(ks, cgn_instance, cgn_instance_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS)) &&
++        msg->has_subscriberaddress) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = add_ip_addr(ks, msg->subscriberaddress);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    if ((ctx->key_fields & (1 << CGN_LOG_KFIELD_PUBLIC_IP_ADDRESS)) &&
++        msg->has_natallocatedaddress) {
++        ret = add_delim(&add_delimiter, ks, delimiter, delimiter_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++
++        ret = add_ip_addr(ks, msg->natallocatedaddress);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    return 0;
++
++fail:
++    flb_debug("[in_zmq] %s: failed creating key (%s)\n",
++             __func__, strerror(-ret));
++    return ret;
++}
++
++static int build_res_constraint_key(struct flb_in_zmq_ctx *ctx,
++                                    struct app_str *ks)
++{
++    int ret;
++
++    if (ctx->key_fields & (1 << CGN_LOG_KFIELD_CGN_INSTANCE)) {
++        ret = app_str_raw(ks, cgn_instance, cgn_instance_strlen);
++        if (unlikely(ret < 0))
++            goto fail;
++    }
++
++    return 0;
++
++fail:
++    flb_debug("[in_zmq] %s: failed creating key (%s)\n",
++             __func__, strerror(-ret));
++    return ret;
++}
++
++/*
++ * Create the required key for the type of log on the channel.
++ * If this is malloced (i.e. *static_key is false), then it should be
++ * freed by the caller when no longer needed.
++ */
++static int get_kafka_key(struct flb_in_zmq_ctx *ctx, void **key,
++                         size_t *keylen, bool *static_key, CgnatLog *cmsg)
++{
++    struct app_str ks;
++    int ret;
++
++    /* Optimisation for the key being empty */
++    if (ctx->key_fields == 0) {
++        *key = (char *)"";
++        *keylen = 0;
++        *static_key = true;
++        return 0;
++    }
++
++    /* Optimisation for the key being the cgninstance */
++    if (ctx->key_fields == (1 << CGN_LOG_KFIELD_CGN_INSTANCE)) {
++        *key = (char *)cgn_instance;
++        *keylen = cgn_instance_strlen;
++        *static_key = true;
++        return 0;
++    }
++
++    ret = app_str_new(&ks, ctx->key_allocation_size);
++    if (unlikely(ret < 0)) {
++        flb_error("[in_zmq] %s: app_str_new failed (%s)\n",
++                  __func__, strerror(-ret));
++        return ret;
++    }
++
++    switch(ctx->ltype) {
++
++    case CGN_LOG_TYPE_SESSION:
++        ret = build_session_key(ctx, &ks, cmsg->sessionlog);
++        break;
++
++    case CGN_LOG_TYPE_PORT_BLOCK_ALLOCATION:
++        ret = build_port_block_alloc_key(ctx, &ks, cmsg->portallocationlog);
++        break;
++
++    case CGN_LOG_TYPE_SUBSCRIBER:
++        ret = build_subscriber_key(ctx, &ks, cmsg->subscriberlog);
++        break;
++
++    case CGN_LOG_TYPE_RES_CONSTRAINT:
++        ret = build_res_constraint_key(ctx, &ks);
++        break;
++
++    default:
++        flb_error("[in_zmq] %s: unknown log type: %d", __func__,
++              ctx->ltype);
++        return -EINVAL;
++    }
++
++    if (ret < 0) {
++        app_str_free_buf(&ks);
++        return ret;
++    }
++
++    *static_key = false;
++    *key = app_str_buf(&ks);
++    *keylen = app_str_used_len(&ks);
++
++    /*
++     * Expand the size allocated for future logs, to save having to reallocate.
++     */
++    if (app_str_total_len(&ks) > ctx->key_allocation_size)
++        ctx->key_allocation_size = app_str_total_len(&ks);
++
++    return 0;
++}
++
++/*
++ * Parse names of key fields, which are of format:
++ *
++ *      [<field1> [<field2> ...]]
++ */
++static int parse_keys(struct flb_in_zmq_ctx *ctx, const char *keys)
++{
++    int ret;
++    unsigned long key_fields = 0;
++    enum cgn_log_key_field key_field;
++    char *ks, *key;
++    char *strtok_state;
++
++    /* need to duplicate as the string will get modified. */
++    ks = strdupa(keys);
++    if (ks == NULL) {
++        flb_error("[in_zmq] %s: strdupa failed", __func__);
++        return -ENOMEM;
++    }
++
++    key = strtok_r(ks, " ", &strtok_state);
++
++    while (key != NULL) {
++        ret = cgn_get_log_key_field(key, &key_field);
++        if (ret < 0) {
++            flb_error("[in_zmq] %s: cgn_get_log_key_field failed "
++                                "for field %s", __func__, key);
++            return -EINVAL;
++        }
++
++        if (!cgn_is_field_key_valid_for_log_type(ctx->ltype, key_field)) {
++            const char *ltype_str = cgn_get_log_type_name(ctx->ltype);
++            flb_error("[in_zmq] %s: key field %s is not valid for type %s",
++                      __func__, key, ltype_str ? ltype_str : "unknown");
++                return -EINVAL;
++        }
++
++        key_fields |= (1 << key_field);
++
++        key = strtok_r(NULL, " ", &strtok_state);
++    }
++
++    ctx->key_fields = key_fields;
++
++    return 0;
++}
++
+ static int zmq_config_read(struct flb_in_zmq_ctx *ctx,
+                            struct flb_input_instance *i_ins)
+ {
+-    const char *hwm_str;
++    const char *str;
++    const char *key_field_str;
++    int ret;
+ 
+     /* Get input properties */
+     ctx->zmq_endpoint = flb_input_get_property("endpoint", i_ins);
+@@ -56,13 +541,49 @@
+         return -1;
+     }
+ 
+-    hwm_str = flb_input_get_property("hwm", i_ins);
+-    if (hwm_str == NULL)
++    str = flb_input_get_property("log_type", i_ins);
++    if (str == NULL) {
++        flb_error("[in_zmq] error reading 'log_type' from configuration");
++        return -1;
++    }
++
++    ret = cgn_get_log_type(str, &(ctx->ltype));
++    if (ret < 0) {
++        flb_error("[in_zmq] invalid log_type '%s' in configuration", str);
++        return -1;
++    }
++
++    ctx->topic = flb_input_get_property("topic", i_ins);
++
++    if (ctx->topic == NULL) {
++        flb_error("[in_zmq] error reading 'topic' from configuration");
++        return -1;
++    }
++    ctx->topic_strlen = strlen(ctx->topic);
++
++    ctx->delimiter = flb_input_get_property("field_delimiter", i_ins);
++
++    if (ctx->delimiter == NULL)
++        ctx->delimiter = "_";
++    ctx->delimiter_strlen = strlen(ctx->delimiter);
++
++    key_field_str = flb_input_get_property("key_field", i_ins);
++
++    if (key_field_str != NULL) {
++        ret = parse_keys(ctx, key_field_str);
++        if (ret < 0)
++            return -1;
++
++        ctx->key_allocation_size = calculate_alloc_key_size(ctx);
++    }
++
++    str = flb_input_get_property("hwm", i_ins);
++    if (str == NULL)
+         ctx->zmq_hwm = 0;    /* default of unlimited */
+     else {
+-        ctx->zmq_hwm = atoi(hwm_str);
++        ctx->zmq_hwm = atoi(str);
+         if (ctx->zmq_hwm < 0) {
+-            flb_error("[in_zmq] invalid config value for 'hwm' (%s)", hwm_str);
++            flb_error("[in_zmq] invalid config value for 'hwm' (%s)", str);
+             return -1;
+         }
+     }
+@@ -70,8 +591,197 @@
+     ctx->zmq_pull_socket = NULL;
+     ctx->ul_fd = -1;
+ 
+-    flb_debug("[in_zmq] endpoint='%s', hwm=%d", ctx->zmq_endpoint,
+-              ctx->zmq_hwm);
++    flb_debug("[in_zmq] endpoint='%s', log_type='%s', topic='%s', "
++              "field_delimiter='%s', keys='%s', hwm=%d" ,
++              ctx->zmq_endpoint, cgn_get_log_type_name(ctx->ltype),
++              ctx->topic, ctx->delimiter, key_field_str, ctx->zmq_hwm);
++
++    return 0;
++}
++
++static int in_zmq_pack_with_meta(struct flb_in_zmq_ctx *ctx, zmsg_t *zmsg,
++                                 msgpack_packer *mp_pck)
++{
++    zframe_t *frame;
++
++    /* We store the 3 parts in msgpack - "topic", "key", and "payload". */
++    msgpack_pack_map(mp_pck, 3);
++
++    frame = zmsg_pop(zmsg);
++    if (unlikely(frame == NULL)) {
++        flb_warn("[in_zmq] %s: dropping message with missing frame 1",
++                 __func__);
++        return -EINVAL;
++    }
++    msgpack_pack_str(mp_pck, 5);
++    msgpack_pack_str_body(mp_pck, "topic", 5);
++    msgpack_pack_str(mp_pck, zframe_size(frame));
++    msgpack_pack_str_body(mp_pck, zframe_data(frame), zframe_size(frame));
++    zframe_destroy(&frame);
++
++    frame = zmsg_pop(zmsg);
++    if (unlikely(frame == NULL)) {
++        flb_warn("[in_zmq] %s: dropping message with missing frame 2",
++                 __func__);
++        return -EINVAL;
++    }
++    msgpack_pack_str(mp_pck, 3);
++    msgpack_pack_str_body(mp_pck, "key", 3);
++    msgpack_pack_str(mp_pck, zframe_size(frame));
++    msgpack_pack_str_body(mp_pck, zframe_data(frame), zframe_size(frame));
++    zframe_destroy(&frame);
++
++    frame = zmsg_pop(zmsg);
++    if (unlikely(frame == NULL)) {
++        flb_warn("[in_zmq] %s: dropping message with missing frame 3",
++                 __func__);
++        return -EINVAL;
++    }
++    msgpack_pack_str(mp_pck, 7);
++    msgpack_pack_str_body(mp_pck, "payload", 7);
++    msgpack_pack_bin(mp_pck, zframe_size(frame));
++    msgpack_pack_bin_body(mp_pck, zframe_data(frame), zframe_size(frame));
++    zframe_destroy(&frame);
++
++    return 0;
++}
++
++static int in_zmq_pack_without_meta(struct flb_in_zmq_ctx *ctx, zmsg_t *zmsg,
++                                    msgpack_packer *mp_pck)
++{
++    zframe_t *frame;
++    int ret;
++    void *key;
++    size_t keylen;
++    bool static_key;
++    byte *in_pb;
++    size_t in_pb_size;
++    byte *out_pb;
++    size_t out_pb_size;
++    CgnatLog cmsg = CGNAT_LOG__INIT;
++
++    frame = zmsg_pop(zmsg);
++    if (unlikely(frame == NULL)) {
++        flb_warn("[in_zmq] %s: dropping message with missing frame 1",
++                 __func__);
++        return -EINVAL;
++    }
++
++    in_pb = zframe_data(frame);
++    in_pb_size = zframe_size(frame);
++
++    /* add the outer container message */
++    cmsg.cgninstance = cgn_instance;
++
++    switch(ctx->ltype) {
++    case CGN_LOG_TYPE_SESSION:
++    {
++        SessionLog *msg = session_log__unpack(NULL, in_pb_size, in_pb);
++
++        if (msg == NULL) {
++            flb_error("[in_zmq] %s: failed to extract session protobuf\n",
++                    __func__);
++            return -EINVAL;
++        }
++
++        cmsg.log_type_case = CGNAT_LOG__LOG_TYPE_SESSION_LOG;
++        cmsg.sessionlog = msg;
++        break;
++    }
++
++    case CGN_LOG_TYPE_PORT_BLOCK_ALLOCATION:
++    {
++        PortAllocationLog *msg = port_allocation_log__unpack(NULL,
++            in_pb_size, in_pb);
++
++        if (msg == NULL) {
++            flb_error("[in_zmq] %s: failed to extract port block allocation "
++                      "protobuf\n", __func__);
++            return -EINVAL;
++        }
++
++        cmsg.log_type_case = CGNAT_LOG__LOG_TYPE_PORT_ALLOCATION_LOG;
++        cmsg.portallocationlog = msg;
++        break;
++    }
++
++    case CGN_LOG_TYPE_SUBSCRIBER:
++    {
++        SubscriberLog *msg = subscriber_log__unpack(NULL, in_pb_size, in_pb);
++
++        if (msg == NULL) {
++            flb_error("[in_zmq] %s: failed to extract subscriber protobuf\n",
++                    __func__);
++            return -EINVAL;
++        }
++
++        cmsg.log_type_case = CGNAT_LOG__LOG_TYPE_SUBSCRIBER_LOG;
++        cmsg.subscriberlog = msg;
++        break;
++    }
++
++    case CGN_LOG_TYPE_RES_CONSTRAINT:
++    {
++        ConstraintLog *msg = constraint_log__unpack(NULL, in_pb_size, in_pb);
++
++        if (msg == NULL) {
++            flb_error("[in_zmq] %s: failed to extract resource constraint "
++                      "protobuf\n", __func__);
++            return -EINVAL;
++        }
++
++        cmsg.log_type_case = CGNAT_LOG__LOG_TYPE_CONSTRAINT_LOG;
++        cmsg.constraintlog = msg;
++        break;
++    }
++
++    default:
++        flb_error("[in_zmq] %s: unknown log type: %d", __func__,
++              ctx->ltype);
++        zframe_destroy(&frame);
++        return -EINVAL;
++    }
++
++    zframe_destroy(&frame);
++
++    out_pb_size = cgnat_log__get_packed_size(&cmsg);
++    out_pb = malloc(out_pb_size);
++    if (unlikely(out_pb == NULL)) {
++        flb_error("[in_zmq] %s: failed allocation protobuf to send out",
++                  __func__);
++        return -ENOMEM;
++    }
++
++    cgnat_log__pack(&cmsg, out_pb);
++
++    /* We store 3 parts in msgpack - "topic", "key", and "payload". */
++    msgpack_pack_map(mp_pck, 3);
++
++    msgpack_pack_str(mp_pck, 5);
++    msgpack_pack_str_body(mp_pck, "topic", 5);
++    msgpack_pack_str(mp_pck, ctx->topic_strlen);
++    msgpack_pack_str_body(mp_pck, ctx->topic, ctx->topic_strlen);
++
++    ret = get_kafka_key(ctx, &key, &keylen, &static_key, &cmsg);
++    if (ret < 0) {
++        free(out_pb);
++        return ret;
++    }
++
++    msgpack_pack_str(mp_pck, 3);
++    msgpack_pack_str_body(mp_pck, "key", 3);
++    msgpack_pack_str(mp_pck, keylen);
++    msgpack_pack_str_body(mp_pck, key, keylen);
++
++    if (!static_key)
++        free(key);
++
++    msgpack_pack_str(mp_pck, 7);
++    msgpack_pack_str_body(mp_pck, "payload", 7);
++    msgpack_pack_bin(mp_pck, out_pb_size);
++    msgpack_pack_bin_body(mp_pck, out_pb, out_pb_size);
++
++    free(out_pb);
+ 
+     return 0;
+ }
+@@ -84,29 +794,18 @@
+     struct flb_in_zmq_ctx *ctx = in_context;
+     msgpack_packer mp_pck;
+     msgpack_sbuffer mp_sbuf;
+-    int zevents = zsock_events(ctx->zmq_pull_socket);
++    int zevents;
+     zmsg_t *zmsg;
+     size_t num_frames;
+-    zframe_t *frame;
+-
+-    if ((zevents & ZMQ_POLLIN) == 0)    /* nothing to read */
+-        return 0;
+ 
+     /* Note that all messages need read, as ZMQ events are edge-triggered */
+-    while (zevents & ZMQ_POLLIN) {
++    for (zevents = zsock_events(ctx->zmq_pull_socket);
++         zevents & ZMQ_POLLIN; zevents = zsock_events(ctx->zmq_pull_socket)) {
++
+         zmsg = zmsg_recv(ctx->zmq_pull_socket);
+         if (zmsg == NULL)
+             continue;
+ 
+-        /* There should be 3 frames - topic, key, and payload */
+-        num_frames = zmsg_size(zmsg);
+-        if (num_frames != 3) {
+-            flb_warn("[in_zmq] dropping message with wrong number of frames "
+-                     "(%d)", num_frames);
+-            zmsg_destroy(&zmsg);
+-            continue;
+-        }
+-
+         /* Initialize local msgpack buffer */
+         msgpack_sbuffer_init(&mp_sbuf);
+         msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+@@ -118,59 +817,31 @@
+         msgpack_pack_array(&mp_pck, 2);
+         flb_pack_time_now(&mp_pck);
+ 
+-        /* We then store the 3 parts - "topic", "key", and "payload". */
+-        msgpack_pack_map(&mp_pck, 3);
+-
+-        frame = zmsg_pop(zmsg);
+-        if (unlikely(frame == NULL)) {
+-            flb_warn("[in_zmq] dropping message with missing frame 1 "
+-                     "(%d)", num_frames);
+-            msgpack_sbuffer_destroy(&mp_sbuf);
+-            zmsg_destroy(&zmsg);
+-            continue;
+-        }
+-        msgpack_pack_str(&mp_pck, 5);
+-        msgpack_pack_str_body(&mp_pck, "topic", 5);
+-        msgpack_pack_str(&mp_pck, zframe_size(frame));
+-        msgpack_pack_str_body(&mp_pck, zframe_data(frame), zframe_size(frame));
+-        zframe_destroy(&frame);
+-
+-        frame = zmsg_pop(zmsg);
+-        if (unlikely(frame == NULL)) {
+-            flb_warn("[in_zmq] dropping message with missing frame 2 "
++        num_frames = zmsg_size(zmsg);
++        if (likely(num_frames == 1)) {
++            /* There is a single frame containing the payload */
++            ret = in_zmq_pack_without_meta(ctx, zmsg, &mp_pck);
++        } else if (num_frames == 3) {
++            /* There should be 3 frames - topic, key, and payload */
++            ret = in_zmq_pack_with_meta(ctx, zmsg, &mp_pck);
++        } else {
++            flb_warn("[in_zmq] dropping message with wrong number of frames "
+                      "(%d)", num_frames);
+             msgpack_sbuffer_destroy(&mp_sbuf);
+             zmsg_destroy(&zmsg);
+             continue;
+         }
+-        msgpack_pack_str(&mp_pck, 3);
+-        msgpack_pack_str_body(&mp_pck, "key", 3);
+-        msgpack_pack_str(&mp_pck, zframe_size(frame));
+-        msgpack_pack_str_body(&mp_pck, zframe_data(frame), zframe_size(frame));
+-        zframe_destroy(&frame);
+ 
+-        frame = zmsg_pop(zmsg);
+-        if (unlikely(frame == NULL)) {
+-            flb_warn("[in_zmq] dropping message with missing frame 3 "
+-                     "(%d)", num_frames);
+-            msgpack_sbuffer_destroy(&mp_sbuf);
+-            zmsg_destroy(&zmsg);
+-            continue;
++        if (ret >= 0) {
++            ret = flb_input_chunk_append_raw(in, NULL, 0, mp_sbuf.data,
++                                             mp_sbuf.size);
++            if (unlikely(ret < 0))
++                flb_warn("[in_zmq] flb_input_chunk_append_raw failed of "
++                         "size %u", mp_sbuf.size);
+         }
+-        msgpack_pack_str(&mp_pck, 7);
+-        msgpack_pack_str_body(&mp_pck, "payload", 7);
+-        msgpack_pack_bin(&mp_pck, zframe_size(frame));
+-        msgpack_pack_bin_body(&mp_pck, zframe_data(frame), zframe_size(frame));
+-        zframe_destroy(&frame);
+ 
+-        ret = flb_input_chunk_append_raw(in, NULL, 0, mp_sbuf.data,
+-                                         mp_sbuf.size);
+-        if (unlikely(ret < 0))
+-            flb_warn("[in_zmq] flb_input_chunk_append_raw failed of size %u",
+-                     mp_sbuf.size);
++        zmsg_destroy(&zmsg);
+         msgpack_sbuffer_destroy(&mp_sbuf);
+-
+-        zevents = zsock_events(ctx->zmq_pull_socket);
+     }
+ 
+     return 0;
+@@ -179,17 +850,21 @@
+ static void in_zmq_pause(void *data, struct flb_config *config)
+ {
+     struct flb_in_zmq_ctx *ctx = data;
+-    flb_debug("[in_zmq] pausing endpoint %s on fd %d", ctx->zmq_endpoint,
+-              ctx->ul_fd);
+-    flb_input_collector_pause(ctx->ul_fd, ctx->i_ins);
++    if (ctx) {
++        flb_debug("[in_zmq] pausing endpoint %s on fd %d", ctx->zmq_endpoint,
++                  ctx->ul_fd);
++        flb_input_collector_pause(ctx->ul_fd, ctx->i_ins);
++    }
+ }
+ 
+ static void in_zmq_resume(void *data, struct flb_config *config)
+ {
+     struct flb_in_zmq_ctx *ctx = data;
+-    flb_debug("[in_zmq] resuming endpoint %s on fd %d", ctx->zmq_endpoint,
+-              ctx->ul_fd);
+-    flb_input_collector_resume(ctx->ul_fd, ctx->i_ins);
++    if (ctx) {
++        flb_debug("[in_zmq] resuming endpoint %s on fd %d", ctx->zmq_endpoint,
++                  ctx->ul_fd);
++        flb_input_collector_resume(ctx->ul_fd, ctx->i_ins);
++    }
+ }
+ 
+ /* Cleanup zmq input */
+@@ -221,6 +896,13 @@
+      */
+     setenv("ZSYS_SIGHANDLER", "false", 1);
+ 
++    ret = set_cgn_instance();
++    if (ret < 0) {
++        flb_error("[in_zmq] failed to set the cgn instance: %s",
++                  strerror(-ret));
++        goto error;
++    }
++
+     ctx = flb_calloc(1, sizeof(struct flb_in_zmq_ctx));
+     if (!ctx) {
+         flb_error("[in_zmq] flb_calloc failed: %s", strerror(errno));
+--- a/plugins/in_zmq/in_zmq.h
++++ b/plugins/in_zmq/in_zmq.h
+@@ -21,6 +21,7 @@
+ #define FLB_IN_ZMQ_H
+ 
+ #include <czmq.h>
++#include "in_zmq_config.h"
+ 
+ struct flb_input_instance;
+ 
+@@ -29,6 +30,13 @@
+     const char *zmq_endpoint;
+     int zmq_hwm;
+ 
++    const char *delimiter;
++    size_t delimiter_strlen;
++    const char *topic;
++    size_t topic_strlen;
++    unsigned long key_fields;
++    int key_allocation_size;
++    enum cgn_log_type ltype;
+     zsock_t *zmq_pull_socket;
+     int ul_fd;           /* underlying fd for the zmq socket */
+ 
+--- /dev/null
++++ b/plugins/in_zmq/in_zmq_astr.c
+@@ -0,0 +1,108 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++
++/*  ZMQ input plugin for Fluent Bit
++ *  ===============================
++ *  Copyright (C) 2019      The Fluent Bit Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#include <stdlib.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include <errno.h>
++#include "in_zmq_astr.h"
++
++/*
++ * Functions which aid appending to strings
++ */
++
++/* allocate a new app_str string, with initial size */
++int app_str_new(struct app_str *astr, size_t initial_len)
++{
++    if (initial_len < 0)
++        return -EINVAL;
++
++    astr->buf = malloc(initial_len + 1); /* space for '\0' */
++    if (astr->buf == NULL)
++        return -ENOMEM;
++
++    astr->total_buf_len = initial_len;
++    astr->used_buf_len = 0;
++
++    return 0;
++}
++
++/* free just the string part associated with an app_str */
++void app_str_free(char *str)
++{
++    free(str);
++}
++
++#define REALLOC_EXTEND_SIZE 32
++
++/* append to an app_str string using printf-style parameters */
++int app_str_printf(struct app_str *astr, const char *format, ...)
++{
++    va_list args;
++    int space, result;
++
++retry:
++    space = astr->total_buf_len + 1 - astr->used_buf_len;
++    va_start(args, format);
++    result = vsnprintf(astr->buf + astr->used_buf_len, space, format, args);
++    va_end(args);
++
++    if (result < 0)
++        return -EINVAL;
++
++    if (result >= space) {      /* was not enough room */
++        int new_buf_len = astr->total_buf_len + result + REALLOC_EXTEND_SIZE;
++
++        /* remove partially added string */
++        astr->buf[astr->used_buf_len] = '\0';
++
++        char *new_buf = realloc(astr->buf, new_buf_len + 1);
++        if (new_buf == NULL)
++            return -ENOMEM;
++        astr->buf = new_buf;
++        astr->total_buf_len = new_buf_len;
++        goto retry;
++    }
++
++    astr->used_buf_len += result;
++
++    return 0;
++}
++
++/* append to an app_str string with a given string with provided length */
++int app_str_raw(struct app_str *astr, const char *s, size_t slen)
++{
++    if (slen > astr->total_buf_len - astr->used_buf_len) {
++        size_t new_buf_len = astr->total_buf_len + slen + REALLOC_EXTEND_SIZE;
++
++        char *new_buf = realloc(astr->buf, new_buf_len + 1);
++        if (new_buf == NULL)
++            return -ENOMEM;
++        astr->buf = new_buf;
++        astr->total_buf_len = new_buf_len;
++    }
++
++    memcpy(astr->buf + astr->used_buf_len, s, slen);
++    astr->used_buf_len += slen;
++    astr->buf[astr->used_buf_len] = '\0';
++
++    return 0;
++}
+--- /dev/null
++++ b/plugins/in_zmq/in_zmq_astr.h
+@@ -0,0 +1,63 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++
++/*  ZMQ input plugin for Fluent Bit
++ *  ===============================
++ *  Copyright (C) 2019      The Fluent Bit Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#ifndef FLB_IN_ZMQ_ASTR_H
++#define FLB_IN_ZMQ_ASTR_H
++
++/*
++ * Structures and functions used for appending to strings and have
++ * buffer extended when overrun.
++ */
++struct app_str {
++    size_t total_buf_len;
++    size_t used_buf_len;
++    char *buf;
++};
++
++int app_str_new(struct app_str *astr, size_t initial_len);
++/*
++ * The following function must be called if freeing the string
++ * allocated directly (rather than calling free()), in case the
++ * implementation is changed to use an allocator other than malloc.
++ */
++void app_str_free(char *str);
++int app_str_printf(struct app_str *astr, const char *format, ...);
++int app_str_raw(struct app_str *astr, const char *s, size_t slen);
++
++static inline char *app_str_buf(struct app_str *astr)
++{
++    return astr->buf;
++}
++
++static inline void app_str_free_buf(struct app_str *astr)
++{
++    app_str_free(astr->buf);
++}
++
++static inline size_t app_str_used_len(struct app_str *astr)
++{
++    return astr->used_buf_len;
++}
++
++static inline size_t app_str_total_len(struct app_str *astr)
++{
++    return astr->total_buf_len;
++}
++
++#endif /* FLB_IN_ZMQ_ASTR_H */
+--- /dev/null
++++ b/plugins/in_zmq/in_zmq_config.c
+@@ -0,0 +1,130 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++
++/*  ZMQ input plugin for Fluent Bit
++ *  ===============================
++ *  Copyright (C) 2019      The Fluent Bit Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#include <stdlib.h>
++#include <stdbool.h>
++#include <string.h>
++#include <errno.h>
++
++#include "in_zmq_config.h"
++
++static const struct cgn_log_type_info {
++    const char *name;
++    unsigned long key_fields;
++} cgn_log_type_info[CGN_LOG_TYPE_COUNT] = {
++    [CGN_LOG_TYPE_SESSION] = {
++        .name = "session",
++        .key_fields = (1 << CGN_LOG_KFIELD_CGN_INSTANCE) |
++                      (1 << CGN_LOG_KFIELD_SESSION_ID) |
++                      (1 << CGN_LOG_KFIELD_SUB_SESSION_ID) |
++                      (1 << CGN_LOG_KFIELD_IP_PROTOCOL) |
++                      (1 << CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS) |
++                      (1 << CGN_LOG_KFIELD_SUBSCRIBER_PORT) |
++                      (1 << CGN_LOG_KFIELD_PUBLIC_IP_ADDRESS) |
++                      (1 << CGN_LOG_KFIELD_PUBLIC_PORT) |
++                      (1 << CGN_LOG_KFIELD_DEST_IP_ADDRESS) |
++                      (1 << CGN_LOG_KFIELD_DEST_PORT) |
++                      (1 << CGN_LOG_KFIELD_INTERFACE),
++    },
++    [CGN_LOG_TYPE_PORT_BLOCK_ALLOCATION] = {
++        .name = "port-block-allocation",
++        .key_fields = (1 << CGN_LOG_KFIELD_CGN_INSTANCE) |
++                      (1 << CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS) |
++                      (1 << CGN_LOG_KFIELD_PUBLIC_IP_ADDRESS),
++    },
++    [CGN_LOG_TYPE_SUBSCRIBER] = {
++        .name = "subscriber",
++        .key_fields = (1 << CGN_LOG_KFIELD_CGN_INSTANCE) |
++                      (1 << CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS),
++    },
++    [CGN_LOG_TYPE_RES_CONSTRAINT] = {
++        .name = "resource-constraint",
++        .key_fields = (1 << CGN_LOG_KFIELD_CGN_INSTANCE),
++    },
++};
++
++const char *cgn_get_log_type_name(enum cgn_log_type type)
++{
++    if (type >= CGN_LOG_TYPE_COUNT)
++        return NULL;
++    return cgn_log_type_info[type].name;
++}
++
++int cgn_get_log_type(const char *name, enum cgn_log_type *type)
++{
++    enum cgn_log_type t;
++
++    for (t = 0; t < CGN_LOG_TYPE_COUNT; t++) {
++        if (strcmp(name, cgn_log_type_info[t].name) == 0) {
++            *type = t;
++            return 0;
++        }
++    }
++
++    return -ENOENT;
++}
++
++bool cgn_is_field_key_valid_for_log_type(enum cgn_log_type type,
++                                         enum cgn_log_key_field key_field)
++{
++    if (type >= CGN_LOG_TYPE_COUNT || key_field >= CGN_LOG_KFIELD_COUNT)
++        return false;
++    return (cgn_log_type_info[type].key_fields & (1 << key_field)) != 0;
++}
++
++static const struct cgn_log_key_field_info {
++    const char *name;
++} cgn_log_key_field_info[CGN_LOG_KFIELD_COUNT] = {
++    [CGN_LOG_KFIELD_CGN_INSTANCE]       = { .name = "cgn-instance", },
++    [CGN_LOG_KFIELD_SESSION_ID]         = { .name = "session-id", },
++    [CGN_LOG_KFIELD_SUB_SESSION_ID]     = { .name = "sub-session-id", },
++    [CGN_LOG_KFIELD_IP_PROTOCOL]        = { .name = "ip-protocol", },
++    [CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS]
++                                        = { .name = "subscriber-ip-address", },
++    [CGN_LOG_KFIELD_SUBSCRIBER_PORT]
++                                        = { .name = "subscriber-port", },
++    [CGN_LOG_KFIELD_PUBLIC_IP_ADDRESS]
++                                        = { .name = "public-ip-address", },
++    [CGN_LOG_KFIELD_PUBLIC_PORT]        = { .name = "public-port", },
++    [CGN_LOG_KFIELD_DEST_IP_ADDRESS]
++                                        = { .name = "destination-ip-address", },
++    [CGN_LOG_KFIELD_DEST_PORT]          = { .name = "destination-port", },
++    [CGN_LOG_KFIELD_INTERFACE]          = { .name = "interface", },
++};
++
++const char *cgn_get_log_key_field_name(enum cgn_log_key_field key_field)
++{
++    if (key_field >= CGN_LOG_KFIELD_COUNT)
++        return NULL;
++    return cgn_log_key_field_info[key_field].name;
++}
++
++int cgn_get_log_key_field(const char *name, enum cgn_log_key_field *key_field)
++{
++    enum cgn_log_key_field k;
++
++    for (k = 0; k < CGN_LOG_KFIELD_COUNT; k++) {
++        if (strcmp(name, cgn_log_key_field_info[k].name) == 0) {
++                *key_field = k;
++                return 0;
++        }
++    }
++
++    return -ENOENT;
++}
+--- /dev/null
++++ b/plugins/in_zmq/in_zmq_config.h
+@@ -0,0 +1,99 @@
++/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
++
++/*  ZMQ input plugin for Fluent Bit
++ *  ===============================
++ *  Copyright (C) 2019      The Fluent Bit Authors
++ *
++ *  Licensed under the Apache License, Version 2.0 (the "License");
++ *  you may not use this file except in compliance with the License.
++ *  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++
++#ifndef FLB_IN_ZMQ_CONFIG_H
++#define FLB_IN_ZMQ_CONFIG_H
++
++enum cgn_log_key_field {
++    CGN_LOG_KFIELD_CGN_INSTANCE,
++    CGN_LOG_KFIELD_SESSION_ID,
++    CGN_LOG_KFIELD_SUB_SESSION_ID,
++    CGN_LOG_KFIELD_IP_PROTOCOL,
++    CGN_LOG_KFIELD_SUBSCRIBER_IP_ADDRESS,
++    CGN_LOG_KFIELD_SUBSCRIBER_PORT,
++    CGN_LOG_KFIELD_PUBLIC_IP_ADDRESS,
++    CGN_LOG_KFIELD_PUBLIC_PORT,
++    CGN_LOG_KFIELD_DEST_IP_ADDRESS,
++    CGN_LOG_KFIELD_DEST_PORT,
++    CGN_LOG_KFIELD_INTERFACE,
++
++    CGN_LOG_KFIELD_COUNT                /* Must be last */
++};
++
++/**
++ * Get the name associated with the given CGNAT log key field
++ *
++ * @param key_field The key field of the log to get the name
++ * @return returns the name of the log key field - NULL will be returned
++ *         if an invalid key_field is passed in.
++ */
++const char *cgn_get_log_key_field_name(enum cgn_log_key_field key_field);
++
++/**
++ * Get the log key field associated with a given CGNAT log key_field name
++ *
++ * @param name the name to look up
++ * @param key_field a pointer to a key_field which will be filled in with
++ *        the enum value on success.
++ *
++ * @return returns 0 on success and a negative errno on failure
++ */
++int cgn_get_log_key_field(const char *name, enum cgn_log_key_field *key_field);
++
++enum cgn_log_type {
++    CGN_LOG_TYPE_SESSION,
++    CGN_LOG_TYPE_PORT_BLOCK_ALLOCATION,
++    CGN_LOG_TYPE_SUBSCRIBER,
++    CGN_LOG_TYPE_RES_CONSTRAINT,
++
++    CGN_LOG_TYPE_COUNT              /* Must be last */
++};
++
++/**
++ * Get the name associated with the given CGNAT log type
++ *
++ * @param type The type of the log to get the name
++ * @return returns the name of the log type - NULL will be returned
++ *         if an invalid type is passed in.
++ */
++const char *cgn_get_log_type_name(enum cgn_log_type type);
++
++/**
++ * Get the log type associated with a given CGNAT log type name
++ *
++ * @param name the name to look up
++ * @param type a pointer to a type which will be filled in with
++ *        the enum value on success.
++ *
++ * @return returns 0 on success and a negative errno on failure
++ */
++int cgn_get_log_type(const char *name, enum cgn_log_type *type);
++
++/**
++ * Check the validity of using a certain key field with a log type
++ *
++ * @param type The type of the log to check for validity
++ * @param key_field The key field to check for validity
++ * @return true if the key_field is valid to use with the log type,
++ *         and false if it is not valid or the type or key field is
++ *         invalid.
++ */
++bool cgn_is_field_key_valid_for_log_type(enum cgn_log_type type,
++                                         enum cgn_log_key_field key_field);
++#endif /* FLB_IN_ZMQ_CONFIG_H */

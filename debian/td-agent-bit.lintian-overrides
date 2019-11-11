@@ -1,0 +1,5 @@
+td-agent-bit: embedded-library *
+td-agent-bit: package-name-doesnt-match-sonames libfluent-bit
+td-agent-bit: duplicate-conffile etc/td-agent-bit/parsers.conf
+td-agent-bit: duplicate-conffile etc/td-agent-bit/plugins.conf
+td-agent-bit: duplicate-conffile etc/td-agent-bit/td-agent-bit.conf

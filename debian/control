@@ -1,16 +1,14 @@
 Source: td-agent-bit
 Section: net
 Priority: optional
-Maintainer: Eduardo Silva <eduardo@treasure-data.com>
-Build-Depends: debhelper (>= 7.0.50~), cmake (>= 2.6)
-Standards-Version: 3.9.1
+Maintainer: Vyatta Package Maintainers <DL-vyatta-help@att.com>
+Build-Depends: debhelper (>= 10), cmake (>= 2.6), flex (>= 2.6), bison (>= 3.0), libczmq-dev, protobuf-c-compiler, libprotobuf-c-dev, libvyatta-dataplane-proto-support, systemd
+Standards-Version: 3.9.8
 Homepage: http://fluentbit.io
-Vcs-Git: https://github.com/fluent/fluent-bit
-Vcs-Browser: https://github.com/fluent/fluent-bit
 
 Package: td-agent-bit
 Architecture: any
-Depends: ${misc:Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends}
 Suggests: flex, bison
 Description: High performance Log Forwarder for Linux.
  Fluent Bit is a high performance data collector and log forwarder for Linux. 
