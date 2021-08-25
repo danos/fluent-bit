@@ -1,5 +1,8 @@
 #!/usr/bin/make -f
 
+# Restore pre-GCC 10 behavior
+export DEB_CFLAGS_MAINT_APPEND = -fcommon
+
 %:
 	dh $@ --buildsystem=cmake
 
