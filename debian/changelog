@@ -1,3 +1,10 @@
+td-agent-bit (1.3.2-3) unstable; urgency=medium
+
+  [ Daniel Gollub ]
+  * Restore pre-GCC 10 behavior and use -fcommon
+
+ -- Paul Aitken <paul.aitken@att.com>  Wed, 25 Aug 2021 17:54:22 +0100
+
 td-agent-bit (1.3.2-2) unstable; urgency=medium
 
   * DANOS Import
